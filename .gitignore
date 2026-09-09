@@ -1,0 +1,13 @@
+# Never commit personal Snapchat export data or merged media
+mydata*/
+merged_videos/
+*.mp4
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.zip
+merge_report.json
+
+__pycache__/
+*.pyc
