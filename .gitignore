@@ -11,3 +11,5 @@ merge_report.json
 
 __pycache__/
 *.pyc
+mia/
+*_merged/

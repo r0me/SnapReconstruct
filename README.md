@@ -13,14 +13,34 @@ When you download your data from Snapchat ([accounts.snapchat.com](https://accou
 
 ```console
 $ python3 snapreconstruct.py mydata~1786999390670
-Probing videos...
-332 mp4s -> 86 same-time clusters to examine
-Matching boundary frames...
-85 videos to merge from 291 segments; 2 burst files left standalone
-  merged 2025-11-16_20-42-53_bestfriend_4parts.mp4 (4 parts)
-  ...
-Done: 85 merged videos (42.9 min) in merged_videos
+
+▶ Probing mydata~1786999390670/chat_media
+  reading metadata ██████████████████████████ 332/332 100%
+  done in 11.2s
+  332 videos, 86 same-time clusters to examine
+
+▶ Detecting segments (boundary-frame matching)
+  comparing frames ██████████████████████████ 293/293 100%
+  done in 58.4s
+  291 segments form 85 split videos; 2 same-burst files are distinct videos
+
+▶ Stitching 85 videos
+  stitching ██████████████████████████ 85/85 100%
+  done in 33.0s
+
+▶ Renaming + copying 41 single-segment videos
+  renaming + copying ██████████████████████████ 41/41 100%
+  done in 0.1s
+
+────────────────────────────────────────────────────────
+✔ 85 videos reconstructed from 291 segments (42.9 min of footage)
+✔ 41 single videos renamed + copied
+✔ senders: bestfriend, myusername
+• 2 burst files kept separate (same send time, different videos)
+→ merged_videos
 ```
+
+Live progress bars show the current file and an ETA; output degrades gracefully to plain log lines when piped or redirected.
 
 ---
 
@@ -31,26 +51,31 @@ Done: 85 merged videos (42.9 min) in merged_videos
 - 🔒 **Lossless by default** — merges use ffmpeg stream copy: zero re-encoding, zero quality loss
 - 🎞️ **Handles Snapchat's quirks** — normalizes shuffled audio/video track order, and re-encodes only the rare video whose segments mix h264 + HEVC
 - 🏷️ **Readable filenames with sender attribution** — `2025-11-16_20-42-53_username_4parts.mp4`, matched against your `snap_history.json` / `chat_history.json`
+- 📚 **Complete output** — videos that were never split are copied in too (named `..._1part.mp4`), so the output folder holds every video with one consistent naming scheme (`--merged-only` to skip)
 - 🧾 **Audit trail** — a `merge_report.json` maps every output back to its source segments
 - ✅ **Self-verifying** — every merge is checked against the expected total duration
 - 🕵️ **100% local & private** — your media never leaves your machine; originals are never modified
 
 ## 📦 Requirements
 
-- Python 3.8+ (standard library only — no pip installs)
+- Python 3.8+ (standard library only — `requirements.txt` exists for tooling but is intentionally empty)
 - [ffmpeg / ffprobe](https://ffmpeg.org/download.html) on your `PATH`
 
 ## 🚀 Usage
 
 ```bash
-python3 snapreconstruct.py <export_dir> [-o OUTPUT_DIR]
+python3 snapreconstruct.py [export_dir] [-o OUTPUT_DIR]
 ```
 
-`<export_dir>` is your unzipped Snapchat export — the folder that contains `chat_media/` (and ideally `json/snap_history.json` + `json/chat_history.json`, used only to label who sent each video).
+**No arguments needed** — run it bare and your system's folder picker opens to choose the export folder, then the output folder (Cancel on the output picker uses the default). Dialogs are tried in order: tkinter, zenity/kdialog (Linux), `choose folder` (macOS), FolderBrowserDialog (Windows), then a terminal prompt.
+
+`export_dir` is your unzipped Snapchat export — the folder that contains `chat_media/` (and ideally `json/snap_history.json` + `json/chat_history.json`, used only to label who sent each video). Pointing at `chat_media` itself, or at a folder containing exactly one export, also works.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `-o`, `--output` | `<export_dir>/../merged_videos` | Where merged videos and the report are written |
+| `export_dir` | folder picker | The unzipped export to process |
+| `-o`, `--output` | folder picker, Cancel = `<export_dir>/../merged_videos` | Where merged videos and the report are written |
+| `--merged-only` | off | Only write stitched videos; don't copy the single-segment ones into the output |
 
 Merged files keep the original recording timestamp both in their mp4 metadata (`creation_time`) and file modification time, so they sort correctly in any gallery app.
 
@@ -79,8 +104,11 @@ merged_videos/
 ├── 2025-11-16_20-38-28_bestfriend_3parts.mp4
 ├── 2025-11-16_20-42-53_bestfriend_4parts.mp4
 ├── 2026-02-28_04-11-53_myusername_2parts.mp4
+├── 2026-03-02_19-15-40_bestfriend_1part.mp4
 └── merge_report.json
 ```
+
+`_Nparts` files are stitched; `_1part` files are byte-identical copies of videos that were never split, renamed so the whole folder shares one scheme.
 
 `merge_report.json`:
 
@@ -94,13 +122,22 @@ merged_videos/
    "parts": ["2025-11-16_b~EiAS...mp4", "..."]
   }
  ],
+ "singles": [
+  {
+   "output": "2026-03-02_19-15-40_bestfriend_1part.mp4",
+   "sender": "bestfriend",
+   "duration": 7.9,
+   "parts": ["2026-03-02_b~EiAS...mp4"]
+  }
+ ],
  "errors": [],
  "standalone_in_bursts": ["files that shared a send-time but are separate videos"]
 }
 ```
 
-- **`standalone_in_bursts`** — files that sat in the same time cluster but whose frames don't connect: several distinct videos sent in one message. They're left untouched.
-- Single, unsegmented videos are also left untouched — this tool only creates *new* merged files and never modifies your export.
+- **`singles`** — the never-split videos copied into the output (omitted with `--merged-only`).
+- **`standalone_in_bursts`** — files that sat in the same time cluster but whose frames don't connect: several distinct videos sent in one message. They're still included in the output as `_1part` copies.
+- The tool only creates new files and never modifies your export.
 
 ## ⚠️ Limitations
 

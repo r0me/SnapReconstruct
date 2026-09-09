@@ -1,0 +1,7 @@
+# No Python dependencies - snapreconstruct uses only the standard library.
+# This file exists so `pip install -r requirements.txt` is a safe no-op.
+#
+# You DO need ffmpeg + ffprobe on your PATH (not pip-installable):
+#   Debian/Ubuntu: sudo apt install ffmpeg
+#   macOS:         brew install ffmpeg
+#   Windows:       winget install ffmpeg

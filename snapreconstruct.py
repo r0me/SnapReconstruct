@@ -18,14 +18,134 @@ import datetime
 import itertools
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 CLUSTER_GAP_S = 5        # segments of one video share creation_time within this
 FRAME_MATCH_MAX = 30     # mean abs gray diff; real boundaries score <25, unrelated >36
 SENDER_MATCH_MAX_S = 120 # history event must be this close to attribute a sender
 FRAME_SIZE = 64          # comparison thumbnail edge
+
+
+class Progress:
+    """Single-line terminal progress bar; falls back to periodic plain prints
+    when stdout is not a TTY (logs, pipes, CI)."""
+    BAR_WIDTH = 26
+
+    def __init__(self, label, total):
+        self.label = label
+        self.total = max(total, 1)
+        self.n = 0
+        self.start = time.monotonic()
+        self.tty = sys.stdout.isatty()
+        self._last_draw = 0.0
+
+    def step(self, item=''):
+        self.n += 1
+        now = time.monotonic()
+        if not self.tty:
+            if self.n == self.total or now - self._last_draw >= 5:
+                self._last_draw = now
+                print(f'  {self.label}: {self.n}/{self.total}', flush=True)
+            return
+        if now - self._last_draw < 0.05 and self.n < self.total:
+            return
+        self._last_draw = now
+        frac = self.n / self.total
+        filled = int(self.BAR_WIDTH * frac)
+        bar = '█' * filled + '░' * (self.BAR_WIDTH - filled)
+        eta = ''
+        if 0 < self.n < self.total:
+            rem = (now - self.start) / self.n * (self.total - self.n)
+            eta = f'  eta {int(rem) // 60}:{int(rem) % 60:02d}'
+        cols = shutil.get_terminal_size((80, 20)).columns
+        line = f'  {self.label} {bar} {self.n}/{self.total} {frac:4.0%}{eta}  {item}'
+        print('\r' + line[:cols - 1].ljust(cols - 1), end='', flush=True)
+
+    def interrupt(self, message):
+        """Print a full line (e.g. an error) without corrupting the bar."""
+        if self.tty:
+            cols = shutil.get_terminal_size((80, 20)).columns
+            print('\r' + ' ' * (cols - 1) + '\r', end='')
+        print(message, flush=True)
+        self._last_draw = 0.0
+
+    def close(self):
+        if self.tty:
+            print()
+        elapsed = time.monotonic() - self.start
+        print(f'  done in {elapsed:.1f}s', flush=True)
+
+
+def phase(title):
+    print(f'\n▶ {title}', flush=True)
+
+
+def pick_directory(title, initial=None):
+    """Open the system folder picker; returns the chosen path or None if the
+    dialog was cancelled. Tries tkinter, zenity, kdialog, macOS osascript and
+    Windows PowerShell, then falls back to a plain text prompt."""
+    initial = initial or os.path.expanduser('~')
+    try:
+        import tkinter
+        from tkinter import filedialog
+        root = tkinter.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        path = filedialog.askdirectory(title=title, initialdir=initial)
+        root.destroy()
+        return path or None
+    except Exception:
+        pass
+    candidates = []
+    if sys.platform == 'darwin':
+        candidates.append(['osascript', '-e',
+                           f'POSIX path of (choose folder with prompt "{title}" '
+                           f'default location POSIX file "{initial}")'])
+    elif sys.platform.startswith('win'):
+        candidates.append(['powershell', '-NoProfile', '-Command',
+                           'Add-Type -AssemblyName System.Windows.Forms; '
+                           '$d = New-Object System.Windows.Forms.FolderBrowserDialog; '
+                           f"$d.Description = '{title}'; "
+                           'if ($d.ShowDialog() -eq "OK") { $d.SelectedPath }'])
+    else:
+        candidates.append(['zenity', '--file-selection', '--directory',
+                           f'--title={title}', f'--filename={initial}/'])
+        candidates.append(['kdialog', '--title', title,
+                           '--getexistingdirectory', initial])
+    for cmd in candidates:
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+        return None  # dialog shown but cancelled
+    if sys.stdin.isatty():
+        answer = input(f'{title}\n  (no folder-picker dialog available) '
+                       'path (blank to cancel): ').strip()
+        return os.path.expanduser(answer) or None
+    return None
+
+
+def resolve_export_dir(path):
+    """Be forgiving about what the user points at: accept the export folder,
+    or chat_media itself, or a folder holding exactly one export."""
+    if os.path.isdir(os.path.join(path, 'chat_media')):
+        return path
+    if os.path.basename(os.path.normpath(path)) == 'chat_media':
+        return os.path.dirname(os.path.normpath(path))
+    subs = [os.path.join(path, d) for d in os.listdir(path)
+            if os.path.isdir(os.path.join(path, d, 'chat_media'))] \
+        if os.path.isdir(path) else []
+    if len(subs) == 1:
+        return subs[0]
+    return None
 
 
 def ffprobe(path):
@@ -39,10 +159,12 @@ def ffprobe(path):
 def probe_videos(media_dir):
     rows = []
     files = sorted(f for f in os.listdir(media_dir) if f.lower().endswith('.mp4'))
-    for i, f in enumerate(files):
+    prog = Progress('reading metadata', len(files))
+    for f in files:
+        prog.step(f)
         d = ffprobe(os.path.join(media_dir, f))
         if not d or 'format' not in d:
-            print(f'  ! unreadable, skipping: {f}', file=sys.stderr)
+            prog.interrupt(f'  ! unreadable, skipping: {f}')
             continue
         vstreams = [s for s in d['streams'] if s['codec_type'] == 'video']
         if not vstreams:
@@ -58,8 +180,7 @@ def probe_videos(media_dir):
             f=f, dur=float(d['format'].get('duration', 0)), ct=ct, ts=ts,
             res=f"{v.get('width')}x{v.get('height')}", vcodec=v.get('codec_name'),
             audio=bool(a), mtime=os.path.getmtime(os.path.join(media_dir, f))))
-        if (i + 1) % 50 == 0:
-            print(f'  probed {i + 1}/{len(files)}')
+    prog.close()
     return rows
 
 
@@ -109,10 +230,15 @@ def frame_dist(a, b):
 def build_chains(clusters, media_dir, cache_dir):
     """Within each multi-file cluster, chain segments by frame continuity."""
     chains, standalone_in_bursts = [], []
+    todo = [c for c in clusters if len(c) >= 2]
+    prog = Progress('comparing frames', sum(len(c) for c in todo))
     for c in clusters:
         if len(c) < 2:
             continue
-        frames = {x['f']: boundary_frames(media_dir, x['f'], cache_dir) for x in c}
+        frames = {}
+        for x in c:
+            prog.step(x['f'])
+            frames[x['f']] = boundary_frames(media_dir, x['f'], cache_dir)
         n = len(c)
         dists = {}
         for i, j in itertools.permutations(range(n), 2):
@@ -145,6 +271,7 @@ def build_chains(clusters, media_dir, cache_dir):
                 chains.append([c[k] for k in ch])
             else:
                 standalone_in_bursts.append(c[i]['f'])
+    prog.close()
     return chains, standalone_in_bursts
 
 
@@ -224,61 +351,133 @@ def merge_chain(chain, media_dir, out_path, ct, mtime, tmp_dir):
     return None
 
 
+def unique_path(out_dir, name):
+    base, ext = os.path.splitext(name)
+    path = os.path.join(out_dir, name)
+    n = 2
+    while os.path.exists(path):
+        path = os.path.join(out_dir, f'{base}_{n}{ext}')
+        n += 1
+    return path
+
+
+def copy_singles(singles, media_dir, out_dir, events):
+    """Copy videos that were never split into the output dir, renamed with the
+    same timestamp+sender scheme (suffix _1part) so the set is complete."""
+    copied = []
+    prog = Progress('renaming + copying', len(singles))
+    for x in singles:
+        prog.step(x['f'])
+        ts = x['ts'] or x['mtime']
+        stamp = datetime.datetime.fromtimestamp(
+            ts, datetime.timezone.utc).strftime('%Y-%m-%d_%H-%M-%S')
+        sender = sender_for(ts, events)
+        path = unique_path(out_dir, f'{stamp}_{sender}_1part.mp4')
+        shutil.copy2(os.path.join(media_dir, x['f']), path)
+        copied.append(dict(output=os.path.basename(path), sender=sender,
+                           duration=round(x['dur'], 2), parts=[x['f']]))
+    prog.close()
+    return copied
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument('export_dir', help='unzipped Snapchat export (contains chat_media/)')
+    ap.add_argument('export_dir', nargs='?', default=None,
+                    help='unzipped Snapchat export (contains chat_media/); '
+                         'a folder picker opens if omitted')
     ap.add_argument('-o', '--output', default=None,
-                    help='output dir (default: <export_dir>/../merged_videos)')
+                    help='output dir; a folder picker opens if omitted '
+                         '(Cancel there = default <export_dir>/../merged_videos)')
+    ap.add_argument('--merged-only', action='store_true',
+                    help='only write stitched videos; skip copying single-segment ones')
     args = ap.parse_args()
 
-    export_dir = os.path.abspath(args.export_dir)
+    if args.export_dir is None:
+        print('No export folder given - opening folder picker...')
+        args.export_dir = pick_directory(
+            'Select your Snapchat export folder (the one containing chat_media)')
+        if not args.export_dir:
+            sys.exit('cancelled - no export folder chosen')
+    export_dir = resolve_export_dir(os.path.abspath(args.export_dir))
+    if not export_dir:
+        sys.exit(f'no chat_media/ folder found in {args.export_dir}')
     media_dir = os.path.join(export_dir, 'chat_media')
-    if not os.path.isdir(media_dir):
-        sys.exit(f'no chat_media/ folder in {export_dir}')
-    out_dir = os.path.abspath(args.output or
-                              os.path.join(export_dir, os.pardir, 'merged_videos'))
+
+    default_out = os.path.join(export_dir, os.pardir, 'merged_videos')
+    if args.output is None:
+        print('No output folder given - opening folder picker '
+              '(Cancel = default merged_videos next to the export)...')
+        args.output = pick_directory(
+            'Select the output folder for merged videos (Cancel = default)',
+            initial=os.path.dirname(export_dir))
+    out_dir = os.path.abspath(args.output or default_out)
     os.makedirs(out_dir, exist_ok=True)
 
-    print('Probing videos...')
+    phase(f'Probing {media_dir}')
     rows = probe_videos(media_dir)
     clusters = cluster(rows)
     multi = [c for c in clusters if len(c) > 1]
-    print(f'{len(rows)} mp4s -> {len(multi)} same-time clusters to examine')
+    print(f'  {len(rows)} videos, {len(multi)} same-time clusters to examine')
 
-    print('Matching boundary frames...')
+    phase('Detecting segments (boundary-frame matching)')
     with tempfile.TemporaryDirectory(prefix='snapreconstruct_') as tmp:
         cache = os.path.join(tmp, 'frames')
         os.makedirs(cache)
         chains, burst_singles = build_chains(multi, media_dir, cache)
-        print(f'{len(chains)} videos to merge from '
-              f'{sum(len(c) for c in chains)} segments; '
-              f'{len(burst_singles)} burst files left standalone')
+        n_seg = sum(len(c) for c in chains)
+        print(f'  {n_seg} segments form {len(chains)} split videos; '
+              f'{len(burst_singles)} same-burst files are distinct videos')
 
         events = load_sender_events(export_dir)
+        if not events:
+            print('  ! no json/ history found - senders will be "unknown"')
+
+        phase(f'Stitching {len(chains)} videos')
         report, errors = [], []
+        prog = Progress('stitching', len(chains))
         for chain in chains:
             ct = chain[0]['ct']
             stamp = ct[:19].replace('T', '_').replace(':', '-')
             sender = sender_for(chain[0]['ts'], events)
             name = f'{stamp}_{sender}_{len(chain)}parts.mp4'
+            prog.step(name)
             err = merge_chain(chain, media_dir, os.path.join(out_dir, name),
                               ct, chain[0]['mtime'], tmp)
             if err:
                 errors.append((name, err))
-                print(f'  ERROR {name}: {err}')
+                prog.interrupt(f'  ✗ {name}: {err}')
             else:
                 report.append(dict(output=name, sender=sender,
                                    duration=round(sum(x['dur'] for x in chain), 2),
                                    parts=[x['f'] for x in chain]))
-                print(f'  merged {name} ({len(chain)} parts)')
+        prog.close()
+
+    singles_report = []
+    if not args.merged_only:
+        chained = {x['f'] for chain in chains for x in chain}
+        singles = [r for r in rows if r['f'] not in chained]
+        phase(f'Renaming + copying {len(singles)} single-segment videos')
+        singles_report = copy_singles(singles, media_dir, out_dir, events)
 
     with open(os.path.join(out_dir, 'merge_report.json'), 'w') as fh:
-        json.dump(dict(merged=report, errors=errors,
+        json.dump(dict(merged=report, singles=singles_report, errors=errors,
                        standalone_in_bursts=burst_singles), fh, indent=1)
+
     total = sum(r['duration'] for r in report)
-    print(f'\nDone: {len(report)} merged videos ({total / 60:.1f} min) in {out_dir}')
+    senders = sorted({r['sender'] for r in report + singles_report} - {'unknown'})
+    print('\n' + '─' * 56)
+    print(f'✔ {len(report)} videos reconstructed from {n_seg} segments '
+          f'({total / 60:.1f} min of footage)')
+    if singles_report:
+        print(f'✔ {len(singles_report)} single videos renamed + copied')
+    if senders:
+        print(f'✔ senders: {", ".join(senders)}')
+    if burst_singles:
+        print(f'• {len(burst_singles)} burst files kept separate '
+              f'(same send time, different videos)')
     if errors:
-        print(f'{len(errors)} FAILED - see merge_report.json')
+        print(f'✗ {len(errors)} FAILED - details in merge_report.json')
+    print(f'→ {out_dir}')
 
 
 if __name__ == '__main__':
